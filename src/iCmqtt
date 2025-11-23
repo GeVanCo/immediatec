@@ -160,7 +160,7 @@ Usage:
 
 Copyright (C) 2023-2024  John E. Wulff        <immediateC@gmail.com>
 							  '@'
-$Id: iCmqtt 1.9 $
+$Id: iCmqtt 1.10 $
 .
 
 ########################################################################
@@ -253,6 +253,13 @@ if (not $opt_a and (not defined $opt_F or not defined $opt_I or not defined $opt
 #
 ########################################################################
 
+# Trim leading and trailing spaces.
+sub trim {
+    my $s = shift;
+    $s =~ s/^\s+|\s+$//g;
+    return $s;
+}
+
 my ($icVar, $group, $ONadr, $ONbit, $OFFadr, $OFFbit, $onCnt, $offCnt, $stateCnt);
 my ($Iflag, $IEC, $bit);
 my $icON    = "";
@@ -292,23 +299,82 @@ my $Icnt   = 65535;			# large
 my $Qcnt;
 my $n;
 my $lineCounter = 0;
+my %pending = ();   # track a Switch line that **might** be MQTT
+
+# ---------------------------------------------------------------------------
+# Switch line validation rules (MQTT vs non-MQTT)
+#
+# Valid MQTT Switch must have:
+#   - A quoted "" block (topic) → required, not empty or whitespace-only
+#   - A parenthesized () block (group) → required, not empty or whitespace-only
+#   - Optional <...> tag allowed
+#
+# Logic:
+#   - If both "" and () are present → validate immediately → state S
+#   - If one or both are missing → mark as pending
+#   - Pending is resolved when the next binding block appears:
+#       * If {mqtt="..."} → enforce validation and die if missing/invalid
+#       * If {astro=...} or any other {…} → clear pending silently (non-MQTT)
+#       * If another Switch appears before any {…} → clear pending silently
+#
+# Error collection:
+#   - Collect all errors for the line
+#   - At the end of validation, die with all messages together
+# ---------------------------------------------------------------------------
 
 for ($n = 0; $n <= $Icnt; $n++) {
     open IN, $argv[0] or die "Cannot open input file $argv[0]: $!";
     while (<IN>) {
     $lineCounter++;
-	if ($state eq "B" and m/^\s*Switch\s+(\w+)\s+"(.*)"(\s+<.*>)?\s+\((.*)\)/) {
-	    my $group_str1 = $1;
-	    ($group_str1 && $group_str1 !~ /^\s*$/) || die "*** ERROR iCmqtt: missing topic between \"\" in line\n   $_(line $lineCounter) in .items file.  Required for variable postfix!\n";
-	    my $group_str4= $4;
-	    ($group_str4 && $group_str4 !~ /^\s*$/) || die "*** ERROR iCmqtt: missing group between () in line\n   $_(line $lineCounter) in .items file.  Required for variable prefix!  Will default to \"Group\".\n";
 
-	    ($group) = split /,/, $group_str4;
-		$icVar = "$group $group_str1";
-		$icVar =~ s/\W/ /g;
-		$icVar =~ s/\s+/_/g;
-		$state = "S";		# Switch state
-	} elsif ($state eq "S") {
+    if ($state eq "B" and /^\s*Switch\b/) {
+        my ($switch_name) = /^\s*Switch\s+(\w+)/;
+
+        my $has_quotes = /"[^"]*"/ ? 1 : 0;            # Are there quotes present in the Switch lines?
+        my $has_parens = /\([^)]*\)/ ? 1 : 0;          # Are there parentheses present in the Switch lines?
+
+        # --- inline non-MQTT binding check ---
+        #if (/{astro=/ or /{exec=/ or /{[^m]/) {
+        if (m/{[^m]/) {
+            %pending = ();   # clear immediately
+            next;
+        }
+
+        if ($has_quotes && $has_parens) {
+            # Validate immediately with error collection
+            my @errors;
+
+            my ($topic) = /"([^"]*)"/;
+            $topic = trim($topic);
+            push @errors, "*** ERROR iCmqtt: topic between \"\" cannot be empty or only spaces in line\n   $_(line $lineCounter)\n"
+                if $topic =~ /^\s*$/;
+
+            my ($group) = /\(([^)]*)\)/;
+            push @errors, "*** ERROR iCmqtt: group between () cannot be empty or only spaces in line\n   $_(line $lineCounter)\n"
+                if $group =~ /^\s*$/;
+
+            die join("", @errors) if @errors;
+
+            my ($opt_tag) = /\s+<([^>]+)>/;   # optional
+            my ($first_group) = split /,/, $group;
+            $first_group = trim($first_group);
+            $icVar = "$first_group $topic";
+            $icVar =~ s/\W/ /g;
+            $icVar =~ s/\s+/_/g;
+
+            $state = "S";
+        } else {
+            # Defer judgment until we see what block follows
+            print "Line has no topic and/or group, pending...\n";
+            %pending = (
+                line        => $_,
+                lc          => $lineCounter,
+                name        => ($switch_name // ''),
+                has_quotes  => $has_quotes,
+                has_parens  => $has_parens,
+            );
+        }
+    } elsif ($state eq "S") {
 	    if (m/^\s*{\s*mqtt\s*=\s*"\s*$/) {
 		$onCnt = $offCnt = $stateCnt = 0;
 		$state = "M";
@@ -376,6 +442,51 @@ for ($n = 0; $n <= $Icnt; $n++) {
 		$state = "B";
 	    }
 	}
+
+    # Resolve pending Switch once we see the next significant line
+    if (%pending) {
+        if (m/^\s*{\s*mqtt\s*=\s*"/) {
+            my $src_line = $pending{line};
+            my $src_lc   = $pending{lc};
+            my @errors;
+
+            # Quotes checks
+            if (!$pending{has_quotes}) {
+                push @errors, "*** ERROR iCmqtt: missing \"\" block in line\n   $src_line(line $src_lc)\n";
+            } else {
+                my ($topic) = $src_line =~ /"([^"]*)"/;
+                push @errors, "*** ERROR iCmqtt: topic between \"\" cannot be empty or only spaces in line\n   $src_line(line $src_lc)\n"
+                    if $topic =~ /^\s*$/;
+            }
+
+            # Parens checks
+            if (!$pending{has_parens}) {
+                push @errors, "*** ERROR iCmqtt: missing () block in line\n   $src_line(line $src_lc)\n";
+            } else {
+                my ($group) = $src_line =~ /\(([^)]*)\)/;
+                push @errors, "*** ERROR iCmqtt: group between () cannot be empty or only spaces in line\n   $src_line(line $src_lc)\n"
+                    if $group =~ /^\s*$/;
+            }
+
+            die join("", @errors) if @errors;
+
+            my ($group) = $src_line =~ /\(([^)]*)\)/;
+            my ($topic) = $src_line =~ /"([^"]*)"/;
+            my ($opt_tag) = $src_line =~ /\s+<([^>]+)>/;
+
+            my ($first_group) = split /,/, $group;
+            $icVar = "$first_group $topic";
+            $icVar =~ s/\W/ /g;
+            $icVar =~ s/\s+/_/g;
+
+            $onCnt = $offCnt = $stateCnt = 0;
+            $state = "M";
+            %pending = ();
+        }
+        elsif (m/^\s*{/) {
+            %pending = ();   # non-MQTT binding → clear
+        }
+    }
     }
     close IN;
     if (not $Ipref) {
